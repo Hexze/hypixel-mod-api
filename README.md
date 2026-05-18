@@ -1,0 +1,1 @@
+A dependency plugin for interacting with the Hypixel Mod API, used for getting info about party and location while on the server.
