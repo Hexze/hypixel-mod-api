@@ -2,12 +2,13 @@ plugin = {
     name = "hypixel-mod-api",
     displayName = "Hypixel Mod API",
     prefix = "§bዞ",
-    version = "1.1.1",
-    credits = "Hexze",
+    version = "1.1.2",
+    credits = "",
     description = "Core Hypixel Mod API integration - provides events and functions for other plugins"
 }
 
 -- Constants
+
 local environments = { [0] = "production", [1] = "beta", [2] = "test" }
 local roles = { [0] = "LEADER", [1] = "MOD", [2] = "MEMBER" }
 local errors = {
@@ -22,16 +23,15 @@ local packageRanks = { [1] = "NONE", [2] = "VIP", [3] = "VIP+", [4] = "MVP", [5]
 local monthlyRanks = { [1] = "NONE", [2] = "MVP++" }
 
 -- State
+
 local state = {
     environment = nil,
     location = {},
-    -- True once we've sent our own hypixel:register this connection. This is
-    -- the real "are we talking to the Mod API" signal - unlike `environment`,
-    -- it doesn't depend on having observed hypixel:hello (see below).
     registered = false
 }
 
--- Formatting functions
+-- Formatting
+
 local function formatLocation(loc)
     local parts = {}
     if loc.serverName then parts[#parts + 1] = "§7server§8: §e" .. loc.serverName end
@@ -73,21 +73,9 @@ local function formatPartyInfo(info)
     return table.concat(parts, "\n")
 end
 
--- Protocol
---
--- hypixel:hello is sent unconditionally by the server on every backend join,
--- regardless of client registration - so it cannot tell us whether a client
--- mod already registered, and it's not something we can prompt. Registration
--- (hypixel:register) is a separate, independent message: we send our own
--- regardless of hello, since a spec-compliant mod re-sends its full
--- subscription every time hello fires anyway (self-healing any overlap).
---
--- Because hello is a one-shot per-connection packet, attaching mid-session
--- (the common case: Hypixel was already open before Starfish/this plugin
--- started watching) means we'll never see it. So registration must not be
--- gated on any join/respawn event alone - it also runs once, unconditionally,
--- as soon as this script loads.
-local function subscribeToLocationEvents()
+-- Registration and event wiring
+
+local function register()
     local writer = starfish.encoding.writer()
     writer:varint(1)
     writer:varint(1)
@@ -97,29 +85,21 @@ local function subscribeToLocationEvents()
     state.registered = true
 end
 
--- Safe to call repeatedly: sendPluginMessage silently no-ops if there's no
--- bound session yet, and re-sending register is idempotent.
-local function attemptRegistration()
-    subscribeToLocationEvents()
-end
-
 starfish.events.on("server_join", function()
     state.environment = nil
     state.location = {}
-    attemptRegistration()
+    register()
 end)
 
-starfish.events.on("respawn", attemptRegistration)
+starfish.events.on("respawn", register)
 
--- Event handlers
 starfish.events.on("plugin_message", function(event)
     if event.channel == "hypixel:hello" then
         local reader = starfish.encoding.reader(event.data)
         local envId = reader:varint()
         state.environment = environments[envId] or "unknown"
         state.location = {}
-        -- Re-assert our subscription now that the connection is confirmed live.
-        attemptRegistration()
+        register()
 
     elseif event.channel == "hyevent:location" then
         local reader = starfish.encoding.reader(event.data)
@@ -205,6 +185,7 @@ starfish.events.on("plugin_message", function(event)
 end)
 
 -- Commands
+
 starfish.commands.register("hloc", {
     description = "Show current Hypixel location"
 }, function()
@@ -212,11 +193,6 @@ starfish.commands.register("hloc", {
         starfish.chat.send(starfish.chat.prefix("§cNot connected to Hypixel"))
         return
     end
-
-    -- Environment (production/beta/test) only arrives via the one-shot hello
-    -- packet on a fresh join, so it's frequently unknown when Starfish attaches
-    -- to an already-connected session. It has no functional use elsewhere, so
-    -- it's shown only when we happen to know it rather than as a fake "unknown".
     if state.environment then
         starfish.chat.send(starfish.chat.prefix("§bEnvironment§8: §e" .. state.environment))
     end
@@ -272,7 +248,8 @@ starfish.commands.register("hparty", {
     starfish.server.sendPluginMessage("hypixel:party_info", writer:build())
 end)
 
--- Export public API
+-- Exports
+
 starfish.api.export("getEnvironment", function()
     return state.environment
 end)
@@ -298,8 +275,4 @@ starfish.api.export("requestPartyInfo", function()
     return true
 end)
 
--- Attempt registration once immediately at load. This is the case server_join
--- and respawn can't cover: attaching to (or hot-reloading while on) a session
--- that's already connected to Hypixel, where no fresh join event will ever
--- fire again. Harmless no-op if there's no active connection yet.
-attemptRegistration()
+register()
