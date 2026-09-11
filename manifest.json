@@ -1,0 +1,10 @@
+{
+  "name": "hypixel-mod-api",
+  "display_name": "Hypixel Mod API",
+  "version": "1.2.0",
+  "description": "Core Hypixel Mod API integration - provides events and functions for other plugins",
+  "author": "Hexze",
+  "homepage": null,
+  "dependencies": [],
+  "min_starfish_version": null
+}
