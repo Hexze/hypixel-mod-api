@@ -1,9 +1,24 @@
 {
   "name": "hypixel-mod-api",
   "display_name": "Hypixel Mod API",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Events and functions for other plugins to integrate with the Hypixel Mod API",
+  "prefix": "§bዞ",
   "homepage": null,
   "dependencies": [],
+  "commands": [
+    {
+      "usage": "/hloc",
+      "description": "Show current Hypixel location"
+    },
+    {
+      "usage": "/hparty",
+      "description": "Request and display party info from Hypixel"
+    },
+    {
+      "usage": "/hplayer",
+      "description": "Request and display player info from Hypixel"
+    }
+  ],
   "min_starfish_version": null
 }
