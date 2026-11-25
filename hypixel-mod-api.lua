@@ -2,7 +2,7 @@ plugin = {
     name = "hypixel-mod-api",
     displayName = "Hypixel Mod API",
     prefix = "§bዞ",
-    version = "1.0.0",
+    version = "1.0.1",
     description = "Events and functions for other plugins to integrate with the Hypixel Mod API",
 }
 
@@ -21,11 +21,36 @@ local playerRanks = { [1] = "NORMAL", [2] = "YOUTUBER", [3] = "STAFF" }
 local packageRanks = { [1] = "NONE", [2] = "VIP", [3] = "VIP+", [4] = "MVP", [5] = "MVP+" }
 local monthlyRanks = { [1] = "NONE", [2] = "MVP++" }
 
+local LOCATION_EVENT = "hyevent:location"
+local LOCATION_EVENT_VERSION = 1
+local REGISTER_CHANNEL = "hypixel:register"
+local REGISTER_PACKET_VERSION = 1
+-- The client's mods get this long after Hypixel's hello to register before we do.
+local REGISTER_GRACE_MS = 2000
+local RATE_LIMITED = 3
+-- Hypixel answers one request of a kind every few seconds and refuses the rest (measured:
+-- refused 2 s apart, answered 4 s apart).
+local REQUEST_GAP_MS = 5000
+-- Location events follow a world change within a moment; past this, ask instead.
+local LOCATION_WAIT_MS = 1500
+
 -- Session state
 
 local state = {
     environment = nil,
-    location = {}
+    location = {},
+    locatedAt = nil,
+    changedAt = nil,
+    -- What the client's mods last registered for, and whether this connection is registered.
+    clientEvents = {},
+    registered = false,
+}
+
+-- The client's own mods ask Hypixel too, and every answer reaches us whoever asked, so a recent
+-- answer or one already on its way is shared rather than asked for again.
+local requests = {
+    ["hypixel:player_info"] = { version = 1 },
+    ["hypixel:party_info"] = { version = 2 },
 }
 
 -- Formatting
@@ -79,34 +104,146 @@ local function requestLocation()
     starfish.server.sendPluginMessage("hypixel:location", writer:build())
 end
 
-local function requestPlayerInfo()
-    local writer = starfish.encoding.writer()
-    writer:varint(1)
-    starfish.server.sendPluginMessage("hypixel:player_info", writer:build())
+-- Registration. Hypixel keeps one event registration per connection and each register replaces
+-- the last, so a register of our own would drop every event the client's mods asked for. Ours
+-- rides along in the client's register instead, and we only register by ourselves when no mod
+-- does - and then for the mods' last events too.
+
+local function readEvents(payload)
+    local ok, events = pcall(function()
+        local reader = starfish.encoding.reader(payload)
+        reader:varint()
+        local events = {}
+        for _ = 1, reader:varint() do
+            events[reader:string()] = reader:varint()
+        end
+        return events
+    end)
+    return ok and events or nil
 end
 
-local function requestPartyInfo()
+local function registerPayload(events)
     local writer = starfish.encoding.writer()
-    writer:varint(2)
-    starfish.server.sendPluginMessage("hypixel:party_info", writer:build())
+    local count = 0
+    for _ in pairs(events) do
+        count = count + 1
+    end
+    writer:varint(REGISTER_PACKET_VERSION)
+    writer:varint(count)
+    for event, version in pairs(events) do
+        writer:string(event)
+        writer:varint(version)
+    end
+    return writer:build()
 end
 
-local function register()
+local function withOurs(events)
+    local all = {}
+    for event, version in pairs(events) do
+        all[event] = version
+    end
+    all[LOCATION_EVENT] = all[LOCATION_EVENT] or LOCATION_EVENT_VERSION
+    return all
+end
+
+local function mergeClientRegister(payload)
+    local events = readEvents(payload)
+    if not events then
+        return nil
+    end
+    state.clientEvents = events
+    state.registered = true
+    if events[LOCATION_EVENT] then
+        return nil
+    end
+    return registerPayload(withOurs(events))
+end
+
+local function registerUnlessClientDid()
+    starfish.timers.delay(REGISTER_GRACE_MS, function()
+        if not state.registered then
+            state.registered = true
+            starfish.server.sendPluginMessage(REGISTER_CHANNEL, registerPayload(withOurs(state.clientEvents)))
+        end
+    end)
+end
+
+-- Asks for the location only when no location event followed a world change; a client that
+-- never registered for location events, or a Starfish attached mid-session, still gets one.
+local function expectLocation()
+    local changedAt = starfish.time.monotonic()
+    state.changedAt = changedAt
+    starfish.timers.delay(LOCATION_WAIT_MS, function()
+        if state.changedAt == changedAt and (state.locatedAt or 0) < changedAt then
+            requestLocation()
+        end
+    end)
+end
+
+local function send(channel)
+    local request = requests[channel]
     local writer = starfish.encoding.writer()
-    writer:varint(1)
-    writer:varint(1)
-    writer:string("hyevent:location")
-    writer:varint(1)
-    starfish.server.sendPluginMessage("hypixel:register", writer:build())
-    requestLocation()
+    writer:varint(request.version)
+    starfish.server.sendPluginMessage(channel, writer:build())
+    request.sentAt = starfish.time.monotonic()
+    request.waiting = true
+    request.ours = true
+end
+
+local function ask(channel)
+    local request = requests[channel]
+    local now = starfish.time.monotonic()
+    if request.answer and now - request.answeredAt < REQUEST_GAP_MS then
+        starfish.events.emit(channel, request.answer)
+        return
+    end
+    if request.waiting and now - request.sentAt < REQUEST_GAP_MS then
+        return
+    end
+    local wait = request.sentAt and REQUEST_GAP_MS - (now - request.sentAt) or 0
+    if wait <= 0 then
+        send(channel)
+    elseif not request.queued then
+        request.queued = true
+        starfish.timers.delay(wait, function()
+            request.queued = false
+            send(channel)
+        end)
+    end
+end
+
+-- Our own request refused for the rate limit is retried once rather than reported.
+local function answer(channel, result)
+    local request = requests[channel]
+    request.waiting = false
+    if not result.success and result.error == RATE_LIMITED and request.ours and not request.retried then
+        request.retried = true
+        starfish.timers.delay(REQUEST_GAP_MS, function() send(channel) end)
+        return
+    end
+    request.retried = false
+    if result.success then
+        request.answer = result
+        request.answeredAt = starfish.time.monotonic()
+    end
+    starfish.events.emit(channel, result)
+end
+
+-- Every Hypixel response starts with a success flag. A failure carries only an error code;
+-- a success is followed by the packet version and then its fields.
+local function readResponse(data)
+    local reader = starfish.encoding.reader(data)
+    if not reader:bool() then
+        return nil, reader:varint()
+    end
+    reader:varint()
+    return reader
 end
 
 local function handleLocation(data)
-    local reader = starfish.encoding.reader(data)
-    local version = reader:varint()
-    local success = reader:bool()
+    local reader, errorCode = readResponse(data)
 
-    if success then
+    if reader then
         state.location = {
             serverName = reader:string(),
             serverType = reader:optionalString(),
@@ -114,6 +251,7 @@ local function handleLocation(data)
             mode = reader:optionalString(),
             map = reader:optionalString()
         }
+        state.locatedAt = starfish.time.monotonic()
         starfish.events.emit("hypixel:location", {
             success = true,
             location = state.location
@@ -121,7 +259,6 @@ local function handleLocation(data)
 
         starfish.log.debug("Location: " .. formatLocation(state.location))
     else
-        local errorCode = reader:varint()
         starfish.events.emit("hypixel:location", {
             success = false,
             error = errorCode,
@@ -137,30 +274,42 @@ end
 starfish.events.on("session:join", function()
     state.environment = nil
     state.location = {}
-    register()
+    state.clientEvents = {}
+    state.registered = false
 end)
 
-starfish.events.on("world:respawn", register)
-starfish.events.on("session:attached", register)
+starfish.events.on("world:respawn", expectLocation)
+starfish.events.on("session:attached", requestLocation)
 
 starfish.server.onPluginMessage("hypixel:hello", function(data)
     local reader = starfish.encoding.reader(data)
     local envId = reader:varint()
     state.environment = environments[envId] or "unknown"
     state.location = {}
-    register()
+    state.registered = false
+    registerUnlessClientDid()
+    expectLocation()
+end)
+
+starfish.server.interceptOutgoing(REGISTER_CHANNEL, mergeClientRegister)
+
+starfish.events.on("server:pluginMessageOutgoing", function(message)
+    local request = requests[message.channel]
+    if request then
+        request.sentAt = starfish.time.monotonic()
+        request.waiting = true
+        request.ours = false
+    end
 end)
 
 starfish.server.onPluginMessage("hyevent:location", handleLocation)
 starfish.server.onPluginMessage("hypixel:location", handleLocation)
 
 starfish.server.onPluginMessage("hypixel:player_info", function(data)
-    local reader = starfish.encoding.reader(data)
-    local version = reader:varint()
-    local success = reader:bool()
+    local reader, errorCode = readResponse(data)
 
     local result = {}
-    if success then
+    if reader then
         result.success = true
         result.playerRank = reader:varint()
         result.packageRank = reader:varint()
@@ -171,19 +320,17 @@ starfish.server.onPluginMessage("hypixel:player_info", function(data)
         result.monthlyRankName = monthlyRanks[result.monthlyPackageRank] or "NONE"
     else
         result.success = false
-        result.error = reader:varint()
-        result.errorMessage = errors[result.error] or "Unknown"
+        result.error = errorCode
+        result.errorMessage = errors[errorCode] or "Unknown"
     end
-    starfish.events.emit("hypixel:player_info", result)
+    answer("hypixel:player_info", result)
 end)
 
 starfish.server.onPluginMessage("hypixel:party_info", function(data)
-    local reader = starfish.encoding.reader(data)
-    local version = reader:varint()
-    local success = reader:bool()
+    local reader, errorCode = readResponse(data)
 
     local result = {}
-    if success then
+    if reader then
         result.success = true
         result.inParty = reader:bool()
         result.members = {}
@@ -201,10 +348,10 @@ starfish.server.onPluginMessage("hypixel:party_info", function(data)
         end
     else
         result.success = false
-        result.error = reader:varint()
-        result.errorMessage = errors[result.error] or "Unknown"
+        result.error = errorCode
+        result.errorMessage = errors[errorCode] or "Unknown"
     end
-    starfish.events.emit("hypixel:party_info", result)
+    answer("hypixel:party_info", result)
 end)
 
 -- Commands
@@ -231,7 +378,7 @@ starfish.commands.register("hplayer", {
         end
     end)
 
-    requestPlayerInfo()
+    ask("hypixel:player_info")
 end)
 
 starfish.commands.register("hparty", {
@@ -250,7 +397,7 @@ starfish.commands.register("hparty", {
         end
     end)
 
-    requestPartyInfo()
+    ask("hypixel:party_info")
 end)
 
 -- Exports
@@ -264,15 +411,15 @@ starfish.plugin.export("getLocation", function()
 end)
 
 starfish.plugin.export("requestPlayerInfo", function()
-    requestPlayerInfo()
+    ask("hypixel:player_info")
     return true
 end)
 
 starfish.plugin.export("requestPartyInfo", function()
-    requestPartyInfo()
+    ask("hypixel:party_info")
     return true
 end)
 
 -- Startup
 
-register()
+requestLocation()
